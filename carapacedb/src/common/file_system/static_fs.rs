@@ -2,12 +2,17 @@ use std::path::{Path, PathBuf};
 use std::io::{Result, Error, ErrorKind};
 use std::sync::Arc;
 use std::os::unix::io::RawFd;
+
 use super::FileFlags;
 use super::FileLockType;
 use std::ffi::{CString, CStr, OsStr};
 use std::os::unix::ffi::OsStrExt;
 
 pub trait SFileHandle {
+    type FileSystem: SFileSystem;
+
+    fn file_system(&self) -> Arc<Self::FileSystem>; 
+
     fn path(&self) -> &Path;
     fn close(&mut self) -> Result<()>;
 }
@@ -19,7 +24,7 @@ pub trait SFileSystem: Send + Sync {
  
     fn write_at(&self, handle: &Self::Handle, buffer: &[u8], nr_bytes: i64, location: u64) -> Result<()>;
     
-    fn open_file(self: Arc<Self>, path: &Path, flags: super::FileFlags, lock: Option<super::FileLockType>) -> Result<Self::Handle>;
+    fn open_file(self: Arc<Self>, path: &Path, flags: FileFlags, lock: FileLockType) -> Result<Self::Handle>;
 
     fn set_file_pointer(&self, handle: &Self::Handle, location: u64) -> Result<()>;
 
@@ -61,6 +66,12 @@ pub struct LocalFileHandle {
 }
 
 impl SFileHandle for LocalFileHandle {
+    type FileSystem = LocalFileSystem;
+
+    fn file_system(&self) -> Arc<Self::FileSystem> {
+        return self.fs.clone();
+    }
+
     fn path(&self) -> &Path {
         &self.path
     }
@@ -95,7 +106,6 @@ impl Drop for LocalFileHandle {
 
 #[derive(Debug, Default, Clone)]
 pub struct LocalFileSystem;
-
 
 #[cfg(unix)]
 fn remove_directory(path: &Path) -> Result<()> {
@@ -154,9 +164,9 @@ fn remove_directory(path: &Path) -> Result<()> {
             let res = if (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFDIR {
                 remove_directory(&sub_path)
             } else {
-                let ret = unsafe { libc::unlink(sub_path_c.as_ptr()) };
+                let ret = libc::unlink(sub_path_c.as_ptr());
                 if ret != 0 {
-                    Err(Error::last_os_error())
+                    return Err(Error::last_os_error());
                 }
                 Ok(())
             };
@@ -188,7 +198,7 @@ impl SFileSystem for LocalFileSystem {
     fn open_file(
         self: Arc<Self>,
         path: &Path,
-        flags: u8,
+        flags: FileFlags,
         lock_type: FileLockType,
     ) -> Result<Self::Handle> {
         use std::ffi::CString;
@@ -204,23 +214,23 @@ impl SFileSystem for LocalFileSystem {
             "cannot combine READ and CREATE flags"
         );
 
-        let mut open_flags = if flags & FileFlags::READ != 0 {
+        let mut open_flags = if flags.contains(FileFlags::READ) {
             libc::O_RDONLY
         } else {
             libc::O_RDWR | libc::O_CLOEXEC
         };
 
-        if flags & FileFlags::CREATE != 0 {
+        if flags.contains(FileFlags::CREATE) {
             open_flags |= libc::O_CREAT;
         }
     
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if flags & FileFlags::DIRECT_IO != 0 {
+        if flags.contains(FileFlags::DIRECT_IO) != 0 {
             open_flags |= libc::O_SYNC;
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        if flags & FileFlags::DIRECT_IO != 0 {
+        if flags.contains(FileFlags::DIRECT_IO) {
             open_flags |= libc::O_DIRECT | libc::O_SYNC;
         }
 
@@ -232,13 +242,12 @@ impl SFileSystem for LocalFileSystem {
         }
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if flags & FileFlags::DIRECT_IO != 0 {
+        if flags.contains(FileFlags::DIRECT_IO) {
             if unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) } == -1 {
                 unsafe { libc::close(fd) };
                 return Err(io::Error::last_os_error());
             }
         }
-
     
         if lock_type != FileLockType::NoLock {
             let lock_type = match lock_type {
@@ -247,7 +256,7 @@ impl SFileSystem for LocalFileSystem {
                 _ => unreachable!(),
             };
 
-            let mut flock = libc::flock {
+            let flock = libc::flock {
                 l_type: lock_type as i16,
                 l_whence: libc::SEEK_SET as i16,
                 l_start: 0,
@@ -286,7 +295,7 @@ impl SFileSystem for LocalFileSystem {
     }
 
 
-    fn read(&self, handle: &Self::Handle, buffer: &mut [u8], nr_bytes: i64) -> Result<()> {
+    fn read(&self, handle: &Self::Handle, buffer: &mut [u8], nr_bytes: i64) -> Result<u64> {
         let result = unsafe {
             libc::read(
                 handle.fd,
@@ -298,7 +307,7 @@ impl SFileSystem for LocalFileSystem {
         if result == -1 {
             Err(Error::last_os_error())
         } else {
-            Ok(result as usize)
+            Ok(result as u64)
         }
     }
 
@@ -314,7 +323,7 @@ impl SFileSystem for LocalFileSystem {
         if result == -1 {
             Err(Error::last_os_error())
         } else {
-            Ok(result as usize)
+            Ok(result as u64)
         }
     }
 
@@ -333,13 +342,15 @@ impl SFileSystem for LocalFileSystem {
         if path.as_os_str().is_empty() {
             return Ok(false);
         }
+
+        let c_path = CString::new(path.as_os_str().as_bytes())?;
         
-        if unsafe { libc::access(path.as_os_str().as_ptr(), libc::F_OK) } != 0 {
+        if unsafe { libc::access(c_path.as_ptr(), libc::F_OK) } != 0 {
             return Ok(false);
         }
         
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::stat(path.as_os_str().as_ptr(), status.as_mut_ptr()) } != 0 {
+        if unsafe { libc::stat(c_path.as_ptr(), status.as_mut_ptr()) } != 0 {
             return Err(Error::last_os_error());
         }
         
@@ -352,13 +363,15 @@ impl SFileSystem for LocalFileSystem {
         if file_name.as_os_str().is_empty() {
             return Ok(false);
         }
+
+        let c_path = CString::new(file_name.as_os_str().as_bytes())?;
         
-        if unsafe { libc::access(file_name.as_os_str().as_ptr(), libc::F_OK) } != 0 {
+        if unsafe { libc::access(c_path.as_ptr(), libc::F_OK) } != 0 {
             return Ok(false);
         }
         
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::stat(file_name.as_os_str().as_ptr(), status.as_mut_ptr()) } != 0 {
+        if unsafe { libc::stat(c_path.as_ptr(), status.as_mut_ptr()) } != 0 {
             return Err(Error::last_os_error());
         }
         
@@ -369,10 +382,13 @@ impl SFileSystem for LocalFileSystem {
    
     fn create_directory(&self, path: &Path) -> Result<()> {
         let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let stat_result = unsafe { libc::stat(path.as_os_str().as_ptr(), status.as_mut_ptr()) };
+
+        let c_path = CString::new(path.as_os_str().as_bytes())?;
+
+        let stat_result = unsafe { libc::stat(c_path.as_ptr(), status.as_mut_ptr()) };
         
         if stat_result != 0 {
-            let mkdir_result = unsafe { libc::mkdir(path.as_os_str().as_ptr(), 0o755) };
+            let mkdir_result = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
             if mkdir_result != 0 {
                 let err = Error::last_os_error();
                 if err.raw_os_error() != Some(libc::EEXIST) {
@@ -415,12 +431,9 @@ impl SFileSystem for LocalFileSystem {
         }
 
         let mut callback = callback;
-    
-        let c_dir = match CString::new(directory) {
-            Ok(s) => s,
-            Err(_) => return Ok(false),
-        };
-    
+
+        let c_dir = CString::new(directory.as_os_str().as_bytes())?;
+        
         let dir = unsafe { libc::opendir(c_dir.as_ptr()) };
         if dir.is_null() {
             return Ok(false);
@@ -524,25 +537,52 @@ pub enum StaticFileHandle {
     Local(LocalFileHandle),
 }
 
-impl StaticFileSystem {
-    pub fn open_file(
-        &self,
+impl SFileHandle for StaticFileHandle {
+    type FileSystem = StaticFileSystem;
+   
+    fn file_system(&self) -> Arc<Self::FileSystem> {
+        match self {
+           StaticFileHandle::Local(handle) => Arc::new(StaticFileSystem::Local(handle.file_system().clone())),        
+            _ => panic!("unmatched file system"),
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        match self {
+            StaticFileHandle::Local(handle) => handle.close(),
+            _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
+        }   
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            StaticFileHandle::Local(handle) => handle.path(),
+             _ => panic!("unmatched file system"),
+        }
+    }
+}
+
+impl SFileSystem for StaticFileSystem {
+    type Handle = StaticFileHandle;
+
+    fn open_file(
+        self: Arc<Self>,
         path: &Path,
         flags: super::FileFlags,
-        lock: Option<super::FileLockType>,
-    ) -> Result<StaticFileHandle> {
-        match self {
+        lock: FileLockType
+    ) -> Result<Self::Handle> {
+        match &*self {
             StaticFileSystem::Local(fs) => {
-                let handle = fs.open_file(path, flags, lock)?;
+                let handle = fs.clone().open_file(path, flags, lock)?;
                 Ok(StaticFileHandle::Local(handle))
             }
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
     
-    pub fn read_at(
+    fn read_at(
         &self,
-        handle: &StaticFileHandle,
+        handle: &Self::Handle,
         buffer: &mut [u8],
         nr_bytes: i64,
         location: u64,
@@ -556,9 +596,9 @@ impl StaticFileSystem {
     }
  
 
-    pub fn write_at(
+    fn write_at(
         &self,
-        handle: &StaticFileHandle,
+        handle: &Self::Handle,
         buffer: &[u8],
         nr_bytes: i64,
         location: u64,
@@ -571,12 +611,12 @@ impl StaticFileSystem {
         }
     }
     
-    pub fn read(
+    fn read(
         &self,
-        handle: &StaticFileHandle,
+        handle: &Self::Handle,
         buffer: &mut [u8],
         nr_bytes: i64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         match (self, handle) {
             (StaticFileSystem::Local(fs), StaticFileHandle::Local(handle)) => {
                 fs.read(handle, buffer, nr_bytes)
@@ -585,12 +625,12 @@ impl StaticFileSystem {
         }
     }
 
-    pub fn write(
+    fn write(
         &self,
-        handle: &StaticFileHandle,
+        handle: &Self::Handle,
         buffer: &[u8],
         nr_bytes: i64,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         match (self, handle) {
             (StaticFileSystem::Local(fs), StaticFileHandle::Local(handle)) => {
                 fs.write(handle, buffer, nr_bytes)
@@ -600,7 +640,7 @@ impl StaticFileSystem {
     }
 
    
-    pub fn file_size(&self, handle: &StaticFileHandle) -> Result<u64> {
+    fn file_size(&self, handle: &Self::Handle) -> Result<u64> {
         match (self, handle) {
             (StaticFileSystem::Local(fs), StaticFileHandle::Local(handle)) => {
                 fs.file_size(handle)
@@ -610,21 +650,21 @@ impl StaticFileSystem {
     }
     
 
-    pub fn directory_exists(&self, path: &Path) -> Result<bool> {
+    fn directory_exists(&self, path: &Path) -> Result<bool> {
         match self {
             StaticFileSystem::Local(fs) => fs.directory_exists(path),
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
  
-    pub fn create_directory(&self, path: &Path) -> Result<()> {
+    fn create_directory(&self, path: &Path) -> Result<()> {
         match self {
             StaticFileSystem::Local(fs) => fs.create_directory(path),
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }   
     
-    pub fn remove_directory(&self, path: &Path) -> Result<()> {
+    fn remove_directory(&self, path: &Path) -> Result<()> {
         match self {
             StaticFileSystem::Local(fs) => fs.remove_directory(path),
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
@@ -632,42 +672,46 @@ impl StaticFileSystem {
     }
     
    
-    pub fn move_file(&self, src: &Path, dst: &Path) -> Result<()> {
+    fn move_file(&self, src: &Path, dst: &Path) -> Result<()> {
         match self {
             StaticFileSystem::Local(fs) => fs.move_file(src, dst),
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
     
-    pub fn file_exists(&self, file_name: &Path) -> Result<bool> {
+    fn file_exists(&self, file_name: &Path) -> Result<bool> {
         match self {
             StaticFileSystem::Local(fs) => fs.file_exists(file_name),
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
    
-    pub fn remove_file(&self, file_name: &Path) -> Result<()> {
+    fn remove_file(&self, file_name: &Path) -> Result<()> {
         match self {
             StaticFileSystem::Local(fs) => fs.remove_file(file_name),
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
 
-    pub fn path_separator(&self) -> Result<&str> {
+    fn path_separator(&self) -> &'static str {
         match self {
             StaticFileSystem::Local(fs) => fs.path_separator(),
-            _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
+            _ => "/", // 默认值
         }
     }
 
-    pub fn join_path(&self, l: &Path, r: &Path) -> Result<PathBuf> {
+    fn join_path(&self, l: &Path, r: &Path) -> Result<PathBuf> {
         match self {
             StaticFileSystem::Local(fs) => fs.join_path(l, r),
-            _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
+            _ => {
+                let mut path = l.to_path_buf();
+                path.push(r);
+                Ok(path)
+            }
         }
     }
 
-    pub fn fsync(&self, handle: &StaticFileHandle) -> Result<()> {
+    fn fsync(&self, handle: &Self::Handle) -> Result<()> {
         match (self, handle) {
             (StaticFileSystem::Local(fs), StaticFileHandle::Local(handle)) => {
                 fs.fsync(handle)
@@ -675,19 +719,23 @@ impl StaticFileSystem {
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
-}
-
-impl StaticFileHandle {
-    pub fn file_system(&self) -> StaticFSRef {
-        match self {
-            StaticFileHandle::Local(handle) => StaticFSRef::Local(&handle.fs),
-          
+    
+    fn set_file_pointer(&self, handle: &Self::Handle, location: u64) -> Result<()> {
+        match (self, handle) {
+            (StaticFileSystem::Local(fs), StaticFileHandle::Local(handle)) => {
+                fs.set_file_pointer(handle, location)
+            }
+            _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
     
-    pub fn close(self) -> Result<()> {
+    fn list_files<F>(&self, directory: &Path, callback: F) -> Result<bool>
+    where
+        F: FnMut(String),
+    {
         match self {
-            StaticFileHandle::Local(handle) => handle.close(),
+            StaticFileSystem::Local(fs) => fs.list_files(directory, callback),
+            _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
 }

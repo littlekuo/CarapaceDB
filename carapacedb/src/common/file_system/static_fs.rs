@@ -14,18 +14,18 @@ pub trait SFileHandle {
 
 pub trait SFileSystem: Send + Sync {
     type Handle: SFileHandle;
+
+    fn read_at(&self, handle: &Self::Handle, buffer: &mut [u8], nr_bytes: i64, location: u64) -> Result<()>;
+ 
+    fn write_at(&self, handle: &Self::Handle, buffer: &[u8], nr_bytes: i64, location: u64) -> Result<()>;
     
     fn open_file(self: Arc<Self>, path: &Path, flags: super::FileFlags, lock: Option<super::FileLockType>) -> Result<Self::Handle>;
 
-    fn set_file_pointer(handle: &Self::Handle, location: u64) -> Result<()>;
+    fn set_file_pointer(&self, handle: &Self::Handle, location: u64) -> Result<()>;
 
     fn read(&self, handle: &Self::Handle, buffer: &mut [u8], nr_bytes: i64) -> Result<u64>;
 
     fn write(&self, handle: &Self::Handle, buffer: &[u8], nr_bytes: i64) -> Result<u64>;
- 
-    fn read_at(&self, handle: &Self::Handle, buffer: &mut [u8], nr_bytes: i64, location: u64) -> Result<()>;
- 
-    fn write_at(&self, handle: &Self::Handle, buffer: &[u8], nr_bytes: i64, location: u64) -> Result<()>;
 
     fn file_size(&self, handle: &Self::Handle) -> Result<u64>;
     
@@ -39,7 +39,7 @@ pub trait SFileSystem: Send + Sync {
 
     fn remove_file(&self, file_name: &Path) -> Result<()>;
 
-    fn list_files<F>(&self, directory: &Path,  callback: F) -> Result<bool> where F: FnMut(String);
+    fn list_files<F>(&self, directory: &Path, callback: F) -> Result<bool> where F: FnMut(String);
 
     fn path_separator(&self) -> &'static str;
 
@@ -269,7 +269,7 @@ impl SFileSystem for LocalFileSystem {
     }
 
 
-    fn set_file_pointer(handle: &Self::Handle, location: u64) -> Result<()> {
+    fn set_file_pointer(&self, handle: &Self::Handle, location: u64) -> Result<()> {
         let result = unsafe {
             libc::lseek(
                 handle.fd,
@@ -445,7 +445,7 @@ impl SFileSystem for LocalFileSystem {
         Ok(true)
      }
 
-     fn path_separator() -> &'static str {
+     fn path_separator(&self) -> &'static str {
         "/"
      }
 
@@ -480,11 +480,40 @@ impl SFileSystem for LocalFileSystem {
         }
     }
 
-    fn join_path(&self, l: &Path, r:&Path) -> Result<PathBuf> {
-        // FIXME: sanitize paths
-        
+    fn join_path(&self, l: &Path, r: &Path) -> Result<PathBuf> {
+        let l_str = l.to_string_lossy();
+        let r_str = r.to_string_lossy();
+        let sep = self.path_separator();
+    
+        let full_path = l_str.to_string() + sep + &r_str;
+        Ok(PathBuf::from(full_path))
     }
 
+    fn read_at(&self, handle: &Self::Handle, buffer: &mut [u8], nr_bytes: i64, location: u64) -> Result<()> {
+        self.set_file_pointer(handle, location)?;
+        let bytes_read = self.read(handle, buffer, nr_bytes)?;
+
+        if bytes_read as i64 != nr_bytes {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof, 
+                format!("read_at failed: expected {} bytes, but read {}", nr_bytes, bytes_read)
+            ));
+        }
+        
+        Ok(())
+    }
+
+    fn write_at(&self, handle: &Self::Handle, buffer: &[u8], nr_bytes: i64, location: u64) -> Result<()> {
+        self.set_file_pointer(handle, location)?;
+        let bytes_written = self.write(handle, buffer, nr_bytes)?;
+        if bytes_written as i64 != nr_bytes {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!("write_at failed: expected {} bytes, but wrote {}", nr_bytes, bytes_written)
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ================= Unified Static File System Struct ============
@@ -510,7 +539,6 @@ impl StaticFileSystem {
             _ => Err(Error::new(ErrorKind::Other, "unmatched file system")),
         }
     }
- 
     
     pub fn read_at(
         &self,
